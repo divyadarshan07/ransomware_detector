@@ -1,28 +1,28 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/inotify.h>
-#include <sys/ioctl.h>
-#include <sys/stat.h>
-#include <sys/types.h>
-#include <fcntl.h>
-#include <unistd.h>
+#include <limits.h>
 #include <time.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <sys/inotify.h>
+#include <sys/select.h>
+#include <sys/time.h>
+#include <linux/limits.h>
 #include "monitor.h"
 #include "entropy.h"
 #include "logger.h"
 
-/* BUG FIX 1: NAME_MAX (255) is the correct max filename length, not 16 */
 #define EVENT_SIZE  (sizeof(struct inotify_event))
 #define BUF_LEN     (1024 * (EVENT_SIZE + NAME_MAX + 1))
 
-/* Modification rate tracking */
 static int    modification_count = 0;
 static time_t window_start;
 
-/* ── Get terminal dimensions safely without popen/tput ── */
 static void get_term_size(int *rows, int *cols) {
-    /* BUG FIX 2: use ioctl() — works even with no $TERM / no tput */
     struct winsize ws;
     *rows = 24;
     *cols = 80;
@@ -32,15 +32,12 @@ static void get_term_size(int *rows, int *cols) {
     }
 }
 
-/* ── Full-screen terminal alert ── */
 static void show_fullscreen_alert(const char *reason) {
     int rows, cols;
     get_term_size(&rows, &cols);
 
-    /* Clear screen, red background, bright-white bold text */
     printf("\033[2J\033[H\033[41;97;1m");
 
-    /* Fill the entire screen with the red background */
     for (int r = 0; r < rows; r++) {
         for (int c = 0; c < cols; c++) putchar(' ');
         putchar('\n');
@@ -48,12 +45,10 @@ static void show_fullscreen_alert(const char *reason) {
 
     char pad_buf[512];
 
-    /* Move cursor to vertical centre */
     int crow = rows / 2 - 5;
     if (crow < 1) crow = 1;
     printf("\033[%d;1H", crow);
 
-    /* ── ASCII banner ── */
     const char *banner[] = {
         " ██████╗  █████╗ ███╗  ██╗███████╗ ██████╗ ███╗  ███╗ ",
         " ██╔══██╗██╔══██╗████╗ ██║██╔════╝██╔═══██╗████╗████║ ",
@@ -72,7 +67,6 @@ static void show_fullscreen_alert(const char *reason) {
         printf("%s%s\n", pad_buf, banner[l]);
     }
 
-    /* ── DETECTED heading (blinking) ── */
     const char *heading = "*** RANSOMWARE DETECTED ***";
     int hlen = (int)strlen(heading);
     int hpad = (cols - hlen) / 2;
@@ -81,7 +75,6 @@ static void show_fullscreen_alert(const char *reason) {
     pad_buf[hpad] = '\0';
     printf("\n%s\033[5m%s\033[25m\n\n", pad_buf, heading);
 
-    /* ── Reason ── */
     int rlen = (int)strlen(reason) + 10;
     int rpad = (cols - rlen) / 2;
     if (rpad < 0) rpad = 0;
@@ -89,7 +82,6 @@ static void show_fullscreen_alert(const char *reason) {
     pad_buf[rpad] = '\0';
     printf("%sReason : %s\n\n", pad_buf, reason);
 
-    /* ── Timestamp ── */
     time_t now = time(NULL);
     char ts[64];
     strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", localtime(&now));
@@ -100,7 +92,6 @@ static void show_fullscreen_alert(const char *reason) {
     pad_buf[tpad] = '\0';
     printf("%sTime   : %s\n\n", pad_buf, ts);
 
-    /* ── Action instruction ── */
     const char *instr = "!!! ACTION REQUIRED: Isolate this machine immediately !!!";
     int ilen = (int)strlen(instr);
     int ipad = (cols - ilen) / 2;
@@ -112,7 +103,6 @@ static void show_fullscreen_alert(const char *reason) {
     printf("\033[0m");
     fflush(stdout);
 
-    /* Hold the alert for 10 seconds then resume */
     sleep(10);
 
     printf("\033[2J\033[H");
@@ -120,7 +110,6 @@ static void show_fullscreen_alert(const char *reason) {
     fflush(stdout);
 }
 
-/* ── Entropy check on a single file ── */
 static void check_entropy(const char *filepath, const char *name) {
     double entropy = calculate_entropy(filepath);
 
@@ -136,7 +125,6 @@ static void check_entropy(const char *filepath, const char *name) {
     }
 }
 
-/* ── Create watch directory if it does not exist ── */
 static void ensure_dir(const char *path) {
     struct stat st;
     if (stat(path, &st) == 0) return;
@@ -148,10 +136,8 @@ static void ensure_dir(const char *path) {
     printf("[*] Created watch directory: %s\n", path);
 }
 
-/* ── Main monitoring entry point ── */
 void start_monitoring(const char *path) {
 
-    /* BUG FIX 3: guarantee the target directory exists before watching */
     ensure_dir(path);
 
     int fd = inotify_init();
@@ -160,13 +146,9 @@ void start_monitoring(const char *path) {
         exit(1);
     }
 
-    /*
-     * BUG FIX 4: also watch IN_MOVED_FROM so we capture the full rename
-     * pair (old-name removed, new-name created).
-     */
     int wd = inotify_add_watch(fd, path,
-                               IN_MODIFY   | IN_CREATE    |
-                               IN_MOVED_FROM | IN_MOVED_TO |
+                               IN_MODIFY     | IN_CREATE    |
+                               IN_MOVED_FROM | IN_MOVED_TO  |
                                IN_DELETE);
     if (wd < 0) {
         perror("inotify_add_watch");
@@ -177,22 +159,20 @@ void start_monitoring(const char *path) {
 
     window_start = time(NULL);
     printf("[*] Watching  : %s\n", path);
-    printf("[*] Thresholds: entropy > 7.5  |  modifications > 10 in 5 s\n\n");
+    printf("[*] Thresholds: entropy > 7.5  |  modifications > 10 in 5s\n\n");
     fflush(stdout);
 
-    /* Aligned buffer for inotify events */
-    char buffer[BUF_LEN] __attribute__((aligned(__alignof__(struct inotify_event))));
+    char buffer[BUF_LEN];
 
     while (1) {
-        /*
-         * BUG FIX 5: use select() with a 1-second timeout instead of a
-         * plain blocking read().  This lets the rate-limit check fire
-         * every second even when no filesystem events arrive.
-         */
         fd_set rfds;
         FD_ZERO(&rfds);
         FD_SET(fd, &rfds);
-        struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+
+        struct timeval tv;
+        tv.tv_sec  = 1;
+        tv.tv_usec = 0;
+
         int ready = select(fd + 1, &rfds, NULL, NULL, &tv);
 
         if (ready < 0) {
@@ -200,7 +180,6 @@ void start_monitoring(const char *path) {
             break;
         }
 
-        /* ── Rate-limit check (runs every tick regardless of events) ── */
         double elapsed = difftime(time(NULL), window_start);
         if (elapsed > 5.0) {
             modification_count = 0;
@@ -208,14 +187,13 @@ void start_monitoring(const char *path) {
         } else if (modification_count > 10) {
             log_alert("Too many file modifications in short time!");
             show_fullscreen_alert(
-                "Mass file modification in 5 s -- rapid encryption in progress");
+                "Mass file modification in 5s -- rapid encryption in progress");
             modification_count = 0;
             window_start = time(NULL);
         }
 
-        if (ready == 0) continue;   /* timeout — no events this second */
+        if (ready == 0) continue;
 
-        /* ── Read and process inotify events ── */
         ssize_t length = read(fd, buffer, BUF_LEN);
         if (length < 0) {
             perror("read inotify");
@@ -237,22 +215,18 @@ void start_monitoring(const char *path) {
                     fflush(stdout);
                     check_entropy(filepath, event->name);
                 }
-
                 if (event->mask & IN_CREATE) {
                     printf("[CREATE]       %s\n", event->name);
                     fflush(stdout);
                 }
-
                 if (event->mask & IN_DELETE) {
                     printf("[DELETE]       %s\n", event->name);
                     fflush(stdout);
                 }
-
                 if (event->mask & IN_MOVED_FROM) {
                     printf("[RENAME-from]  %s\n", event->name);
                     fflush(stdout);
                 }
-
                 if (event->mask & IN_MOVED_TO) {
                     printf("[RENAME-to]    %s\n", event->name);
                     fflush(stdout);

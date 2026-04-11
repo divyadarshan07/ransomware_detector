@@ -1,8 +1,10 @@
-CC = gcc
-CFLAGS = -Wall
+CC      = gcc
+CFLAGS  = -Wall -Wextra -std=c11 -O2
 
-all:
-	$(CC) main.c monitor.c entropy.c logger.c -o detector -lm
+all: detector
+
+detector: main.c monitor.c entropy.c logger.c
+	$(CC) $(CFLAGS) -o detector main.c monitor.c entropy.c logger.c -lm
 
 clean:
-	rm -f detector
+	rm -f detector alerts.log

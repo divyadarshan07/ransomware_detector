@@ -2,190 +2,267 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/inotify.h>
+#include <sys/ioctl.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <fcntl.h>
 #include <unistd.h>
 #include <time.h>
 #include "monitor.h"
 #include "entropy.h"
 #include "logger.h"
 
-#define EVENT_SIZE (sizeof(struct inotify_event))
-#define BUF_LEN (1024 * (EVENT_SIZE + 16))
+/* BUG FIX 1: NAME_MAX (255) is the correct max filename length, not 16 */
+#define EVENT_SIZE  (sizeof(struct inotify_event))
+#define BUF_LEN     (1024 * (EVENT_SIZE + NAME_MAX + 1))
 
-int modification_count = 0;
-time_t start_time;
+/* Modification rate tracking */
+static int    modification_count = 0;
+static time_t window_start;
+
+/* ── Get terminal dimensions safely without popen/tput ── */
+static void get_term_size(int *rows, int *cols) {
+    /* BUG FIX 2: use ioctl() — works even with no $TERM / no tput */
+    struct winsize ws;
+    *rows = 24;
+    *cols = 80;
+    if (ioctl(STDOUT_FILENO, TIOCGWINSZ, &ws) == 0) {
+        if (ws.ws_row > 0) *rows = ws.ws_row;
+        if (ws.ws_col > 0) *cols = ws.ws_col;
+    }
+}
 
 /* ── Full-screen terminal alert ── */
-void show_fullscreen_alert(const char *reason) {
-    /* Clear screen, set red background, white bold text */
-    printf("\033[2J\033[H");                   /* clear + move cursor to top-left  */
-    printf("\033[41;97;1m");                   /* red BG, bright-white bold FG     */
+static void show_fullscreen_alert(const char *reason) {
+    int rows, cols;
+    get_term_size(&rows, &cols);
 
-    /* Fill every line so the whole terminal is red */
-    int rows = 40, cols = 120;                 /* safe fallback dimensions          */
+    /* Clear screen, red background, bright-white bold text */
+    printf("\033[2J\033[H\033[41;97;1m");
 
-    /* Try to read actual terminal size via tput */
-    FILE *rp = popen("tput lines 2>/dev/null", "r");
-    FILE *cp = popen("tput cols  2>/dev/null", "r");
-    if (rp) { fscanf(rp, "%d", &rows); pclose(rp); }
-    if (cp) { fscanf(cp, "%d", &cols); pclose(cp); }
-
-    /* Print blank red lines to fill the screen */
+    /* Fill the entire screen with the red background */
     for (int r = 0; r < rows; r++) {
-        for (int c = 0; c < cols; c++) printf(" ");
-        printf("\n");
+        for (int c = 0; c < cols; c++) putchar(' ');
+        putchar('\n');
     }
 
-    /* Move to vertical center */
-    printf("\033[%d;1H", rows / 2 - 3);
+    char pad_buf[512];
 
-    /* Banner */
-    int pad = (cols - 54) / 2; if (pad < 0) pad = 0;
-    for (int i = 0; i < pad; i++) printf(" ");
-    printf("██████╗  █████╗ ███╗  ██╗███████╗ ██████╗ ███╗  ███╗\n");
+    /* Move cursor to vertical centre */
+    int crow = rows / 2 - 5;
+    if (crow < 1) crow = 1;
+    printf("\033[%d;1H", crow);
 
-    for (int i = 0; i < pad; i++) printf(" ");
-    printf("██╔══██╗██╔══██╗████╗ ██║██╔════╝██╔═══██╗████╗████║\n");
+    /* ── ASCII banner ── */
+    const char *banner[] = {
+        " ██████╗  █████╗ ███╗  ██╗███████╗ ██████╗ ███╗  ███╗ ",
+        " ██╔══██╗██╔══██╗████╗ ██║██╔════╝██╔═══██╗████╗████║ ",
+        " ██████╔╝███████║██╔██╗██║███████╗██║   ██║██╔████╔██║ ",
+        " ██╔══██╗██╔══██║██║╚████║╚════██║██║   ██║██║╚██╔╝██║ ",
+        " ██║  ██║██║  ██║██║ ╚███║███████║╚██████╔╝██║ ╚═╝ ██║ ",
+        " ╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚══╝╚══════╝ ╚═════╝ ╚═╝     ╚═╝ ",
+    };
+    int nlines = (int)(sizeof(banner) / sizeof(banner[0]));
+    for (int l = 0; l < nlines; l++) {
+        int blen = (int)strlen(banner[l]);
+        int lpad = (cols - blen) / 2;
+        if (lpad < 0) lpad = 0;
+        memset(pad_buf, ' ', (size_t)lpad);
+        pad_buf[lpad] = '\0';
+        printf("%s%s\n", pad_buf, banner[l]);
+    }
 
-    for (int i = 0; i < pad; i++) printf(" ");
-    printf("██████╔╝███████║██╔██╗██║███████╗██║   ██║██╔████╔██║\n");
-
-    for (int i = 0; i < pad; i++) printf(" ");
-    printf("██╔══██╗██╔══██║██║╚████║╚════██║██║   ██║██║╚██╔╝██║\n");
-
-    for (int i = 0; i < pad; i++) printf(" ");
-    printf("██║  ██║██║  ██║██║ ╚███║███████║╚██████╔╝██║ ╚═╝ ██║\n");
-
-    for (int i = 0; i < pad; i++) printf(" ");
-    printf("╚═╝  ╚═╝╚═╝  ╚═╝╚═╝  ╚══╝╚══════╝ ╚═════╝ ╚═╝     ╚═╝\n\n");
-
-    /* ── DETECTED heading ── */
-    const char *heading = "🚨  RANSOMWARE DETECTED  🚨";
-    int hlen = 28;  /* visible char width (emoji counts as 2) */
-    pad = (cols - hlen) / 2; if (pad < 0) pad = 0;
-    for (int i = 0; i < pad; i++) printf(" ");
-    printf("\033[5m%s\033[25m\n\n", heading);   /* blinking text */
+    /* ── DETECTED heading (blinking) ── */
+    const char *heading = "*** RANSOMWARE DETECTED ***";
+    int hlen = (int)strlen(heading);
+    int hpad = (cols - hlen) / 2;
+    if (hpad < 0) hpad = 0;
+    memset(pad_buf, ' ', (size_t)hpad);
+    pad_buf[hpad] = '\0';
+    printf("\n%s\033[5m%s\033[25m\n\n", pad_buf, heading);
 
     /* ── Reason ── */
-    int rlen = (int)strlen(reason);
-    pad = (cols - rlen) / 2; if (pad < 0) pad = 0;
-    for (int i = 0; i < pad; i++) printf(" ");
-    printf("Reason : %s\n\n", reason);
+    int rlen = (int)strlen(reason) + 10;
+    int rpad = (cols - rlen) / 2;
+    if (rpad < 0) rpad = 0;
+    memset(pad_buf, ' ', (size_t)rpad);
+    pad_buf[rpad] = '\0';
+    printf("%sReason : %s\n\n", pad_buf, reason);
 
     /* ── Timestamp ── */
     time_t now = time(NULL);
     char ts[64];
     strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", localtime(&now));
-    const char *tslabel = "Time   : ";
-    int tslen = (int)(strlen(tslabel) + strlen(ts));
-    pad = (cols - tslen) / 2; if (pad < 0) pad = 0;
-    for (int i = 0; i < pad; i++) printf(" ");
-    printf("%s%s\n\n", tslabel, ts);
+    int tlen = (int)strlen(ts) + 9;
+    int tpad = (cols - tlen) / 2;
+    if (tpad < 0) tpad = 0;
+    memset(pad_buf, ' ', (size_t)tpad);
+    pad_buf[tpad] = '\0';
+    printf("%sTime   : %s\n\n", pad_buf, ts);
 
-    /* ── Instructions ── */
-    const char *instr = "ACTION REQUIRED: Isolate this machine immediately!";
-    pad = (cols - (int)strlen(instr)) / 2; if (pad < 0) pad = 0;
-    for (int i = 0; i < pad; i++) printf(" ");
-    printf("%s\n", instr);
+    /* ── Action instruction ── */
+    const char *instr = "!!! ACTION REQUIRED: Isolate this machine immediately !!!";
+    int ilen = (int)strlen(instr);
+    int ipad = (cols - ilen) / 2;
+    if (ipad < 0) ipad = 0;
+    memset(pad_buf, ' ', (size_t)ipad);
+    pad_buf[ipad] = '\0';
+    printf("%s\033[1m%s\033[0m\n", pad_buf, instr);
 
-    /* ── Reset colours and flush ── */
     printf("\033[0m");
     fflush(stdout);
 
-    /* Keep alert visible for 10 seconds, then restore normal output */
+    /* Hold the alert for 10 seconds then resume */
     sleep(10);
 
-    /* Restore clean screen for continued monitoring */
     printf("\033[2J\033[H");
-    printf("🛡️  Ransomware Detector — continuing to monitor...\n\n");
+    printf("[*] Ransomware Detector -- continuing to monitor...\n\n");
     fflush(stdout);
 }
 
-void check_ransomware(const char *filename) {
-    /* Build full path relative to monitored dir if needed */
-    char filepath[4096];
-    snprintf(filepath, sizeof(filepath), "%s", filename);
-
+/* ── Entropy check on a single file ── */
+static void check_entropy(const char *filepath, const char *name) {
     double entropy = calculate_entropy(filepath);
 
+    printf("    entropy=%.2f  file=%s\n", entropy, name);
+    fflush(stdout);
+
     if (entropy > 7.5) {
-        char msg[512];
-        snprintf(msg, sizeof(msg),
-                 "High entropy (%.2f) on file: %s — possible encryption", entropy, filename);
+        char msg[640];
+        snprintf(msg, sizeof(msg), "High entropy %.2f on: %s", entropy, filepath);
         log_alert(msg);
-        show_fullscreen_alert("High file entropy — file may be encrypted by ransomware");
+        show_fullscreen_alert(
+            "High file entropy -- file is likely encrypted by ransomware");
     }
 }
 
-void start_monitoring(const char *path) {
-    int fd, wd;
-    char buffer[BUF_LEN];
+/* ── Create watch directory if it does not exist ── */
+static void ensure_dir(const char *path) {
+    struct stat st;
+    if (stat(path, &st) == 0) return;
+    if (mkdir(path, 0755) != 0) {
+        perror("mkdir");
+        fprintf(stderr, "Could not create watch directory: %s\n", path);
+        exit(1);
+    }
+    printf("[*] Created watch directory: %s\n", path);
+}
 
-    fd = inotify_init();
+/* ── Main monitoring entry point ── */
+void start_monitoring(const char *path) {
+
+    /* BUG FIX 3: guarantee the target directory exists before watching */
+    ensure_dir(path);
+
+    int fd = inotify_init();
     if (fd < 0) {
         perror("inotify_init");
         exit(1);
     }
 
-    wd = inotify_add_watch(fd, path, IN_MODIFY | IN_CREATE | IN_MOVED_TO);
+    /*
+     * BUG FIX 4: also watch IN_MOVED_FROM so we capture the full rename
+     * pair (old-name removed, new-name created).
+     */
+    int wd = inotify_add_watch(fd, path,
+                               IN_MODIFY   | IN_CREATE    |
+                               IN_MOVED_FROM | IN_MOVED_TO |
+                               IN_DELETE);
     if (wd < 0) {
         perror("inotify_add_watch");
+        fprintf(stderr, "Path tried: %s\n", path);
+        close(fd);
         exit(1);
     }
 
-    start_time = time(NULL);
-    printf("👁️  Watching: %s\n\n", path);
+    window_start = time(NULL);
+    printf("[*] Watching  : %s\n", path);
+    printf("[*] Thresholds: entropy > 7.5  |  modifications > 10 in 5 s\n\n");
     fflush(stdout);
 
+    /* Aligned buffer for inotify events */
+    char buffer[BUF_LEN] __attribute__((aligned(__alignof__(struct inotify_event))));
+
     while (1) {
-        int length = read(fd, buffer, BUF_LEN);
-        if (length < 0) {
-            perror("read");
+        /*
+         * BUG FIX 5: use select() with a 1-second timeout instead of a
+         * plain blocking read().  This lets the rate-limit check fire
+         * every second even when no filesystem events arrive.
+         */
+        fd_set rfds;
+        FD_ZERO(&rfds);
+        FD_SET(fd, &rfds);
+        struct timeval tv = { .tv_sec = 1, .tv_usec = 0 };
+        int ready = select(fd + 1, &rfds, NULL, NULL, &tv);
+
+        if (ready < 0) {
+            perror("select");
             break;
         }
 
-        for (int i = 0; i < length;) {
-            struct inotify_event *event = (struct inotify_event *)&buffer[i];
+        /* ── Rate-limit check (runs every tick regardless of events) ── */
+        double elapsed = difftime(time(NULL), window_start);
+        if (elapsed > 5.0) {
+            modification_count = 0;
+            window_start = time(NULL);
+        } else if (modification_count > 10) {
+            log_alert("Too many file modifications in short time!");
+            show_fullscreen_alert(
+                "Mass file modification in 5 s -- rapid encryption in progress");
+            modification_count = 0;
+            window_start = time(NULL);
+        }
 
-            if (event->len) {
-                /* Build full file path */
+        if (ready == 0) continue;   /* timeout — no events this second */
+
+        /* ── Read and process inotify events ── */
+        ssize_t length = read(fd, buffer, BUF_LEN);
+        if (length < 0) {
+            perror("read inotify");
+            break;
+        }
+
+        for (ssize_t i = 0; i < length; ) {
+            struct inotify_event *event =
+                (struct inotify_event *)(buffer + i);
+
+            if (event->len > 0) {
                 char filepath[4096];
                 snprintf(filepath, sizeof(filepath), "%s/%s", path, event->name);
 
                 if (event->mask & IN_MODIFY) {
                     modification_count++;
-                    printf("✏️  Modified : %s\n", event->name);
+                    printf("[MODIFY]       %s  (window count: %d)\n",
+                           event->name, modification_count);
                     fflush(stdout);
-                    check_ransomware(filepath);
+                    check_entropy(filepath, event->name);
                 }
 
                 if (event->mask & IN_CREATE) {
-                    printf("➕ Created  : %s\n", event->name);
+                    printf("[CREATE]       %s\n", event->name);
+                    fflush(stdout);
+                }
+
+                if (event->mask & IN_DELETE) {
+                    printf("[DELETE]       %s\n", event->name);
+                    fflush(stdout);
+                }
+
+                if (event->mask & IN_MOVED_FROM) {
+                    printf("[RENAME-from]  %s\n", event->name);
                     fflush(stdout);
                 }
 
                 if (event->mask & IN_MOVED_TO) {
-                    printf("🔀 Renamed  : %s\n", event->name);
+                    printf("[RENAME-to]    %s\n", event->name);
                     fflush(stdout);
                     log_alert("File rename detected (possible ransomware)");
-                    show_fullscreen_alert("Suspicious file rename — classic ransomware behaviour");
+                    show_fullscreen_alert(
+                        "Suspicious file rename -- classic ransomware behaviour");
                 }
             }
 
-            i += EVENT_SIZE + event->len;
-        }
-
-        /* Check modification rate — too many changes in 5 seconds */
-        double elapsed = difftime(time(NULL), start_time);
-        if (elapsed <= 5.0) {
-            if (modification_count > 10) {
-                log_alert("Too many file modifications in short time!");
-                show_fullscreen_alert("Mass file modification detected — rapid encryption in progress");
-                modification_count = 0;
-                start_time = time(NULL);
-            }
-        } else {
-            modification_count = 0;
-            start_time = time(NULL);
+            i += (ssize_t)(EVENT_SIZE + event->len);
         }
     }
 

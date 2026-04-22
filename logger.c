@@ -7,7 +7,9 @@ void log_alert(const char *message) {
     if (!log) return;
 
     time_t now = time(NULL);
-    fprintf(log, "%s - %s\n", ctime(&now), message);
+    char ts[64];
+    strftime(ts, sizeof(ts), "%Y-%m-%d %H:%M:%S", localtime(&now));
+    fprintf(log, "%s - %s\n", ts, message);
 
     fclose(log);
 }

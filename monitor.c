@@ -44,7 +44,6 @@ static void show_fullscreen_alert(const char *reason) {
     }
 
     char pad_buf[512];
-
     int crow = rows / 2 - 5;
     if (crow < 1) crow = 1;
     printf("\033[%d;1H", crow);
@@ -112,7 +111,6 @@ static void show_fullscreen_alert(const char *reason) {
 
 static void check_entropy(const char *filepath, const char *name) {
     double entropy = calculate_entropy(filepath);
-
     printf("    entropy=%.2f  file=%s\n", entropy, name);
     fflush(stdout);
 

@@ -115,7 +115,7 @@ static void check_entropy(const char *filepath, const char *name) {
     fflush(stdout);
 
     if (entropy > 7.5) {
-        char msg[640];
+        char msg[5120];
         snprintf(msg, sizeof(msg), "High entropy %.2f on: %s", entropy, filepath);
         log_alert(msg);
         show_fullscreen_alert(

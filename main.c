@@ -2,7 +2,7 @@
 #include "monitor.h"
 
 int main() {
-    printf("🛡️ Ransomware Detector Started...\n");
-    start_monitoring("./test_dir");  // change folder here
+    printf("Ransomware Detector Started...\n");
+    start_monitoring("/root/test_dir");
     return 0;
 }
